@@ -57,6 +57,31 @@ black tiles are left untouched.
 - Bind it to a Stream Deck key as a **System → Open** action pointing at the file,
   and set the key image to the matching icon in [`imgs/`](./imgs).
 
+## Limitations
+
+**Selected monitors must be contiguous.** A multimon RDP session can only span
+monitors that physically touch and form one connected region. If you select a
+subset with a gap — e.g. the **left + right** monitors with the **primary** sitting
+between them (`selectedmonitors:s:1,2` on this desk) — `mstsc` silently rejects the
+selection and falls back to a single full-screen session on the primary. That's why
+`secondaries.rdp` (`1,3,2`) works: the **top** monitor bridges left and right across
+the top. Remove that bridge and the selection breaks.
+
+Workarounds for "remote on the left and right, but not the middle":
+
+- **Bridge the gap** — include the primary (`1,0,2`). Contiguous, but the session
+  then also covers the middle.
+- **Bridge via the top** — `1,3,2` (the existing `secondaries.rdp`) spans left/top/
+  right and leaves the primary free for local apps.
+- **RemoteApp** — the only way to put remote content on truly non-adjacent monitors.
+  Individual published apps appear as ordinary local windows you can drag onto any
+  monitor, leaving the others local. Because each app *runs on the host*, its network
+  traffic egresses through the host's network — **including the host's VPN** — while
+  your machine only carries the RDP display/input stream. RemoteApp is officially an
+  RDS/Windows Server feature; on a client-edition host it requires the unofficial
+  enablement (registry entries under `...\TSAppAllowList` plus a helper such as the
+  *RemoteApp Tool* to publish apps and emit the `.rdp` files).
+
 ---
 
 ## LLM context — rebuilding or adapting this setup
