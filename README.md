@@ -7,6 +7,7 @@ Personal tooling, automation scripts, and system configuration.
 | Folder | What's in it |
 |--------|-------------|
 | [`/ahk`](./ahk) | AutoHotkey v2 scripts for Windows automation |
+| [`/rdp`](./rdp) | Remote Desktop profiles for projecting a session across a multi-monitor desk |
 
 ## Setup
 
