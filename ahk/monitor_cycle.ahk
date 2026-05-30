@@ -161,4 +161,7 @@ F13:: CycleMonitor("F13", monitors["F13"])
 F14:: CycleMonitor("F14", monitors["F14"])
 F15:: CycleMonitor("F15", monitors["F15"])
 F16:: CycleMonitor("F16", monitors["F16"])
-F17:: ToggleRDP()
+; $ forces AHK's low-level keyboard hook so F17 is caught locally even when a
+; full-screen RDP window has keyboard focus (otherwise mstsc forwards it to the
+; remote and you can't toggle back out). Pairs with keyboardhook:i:0 in the .rdp.
+$F17:: ToggleRDP()
