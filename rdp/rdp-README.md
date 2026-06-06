@@ -15,6 +15,8 @@ Folder: [`ams_laptop/`](./ams_laptop) — connects to host `DESKTOP-417Q585`.
 |------|--------------------|-----------------------------|
 | [`Default.rdp`](./ams_laptop/Default.rdp) | `1,3,0` | left + top + primary (everything but the right) |
 | [`all_left.rdp`](./ams_laptop/all_left.rdp) | `1,3,0` | same as Default — left + top + primary |
+| [`main.rdp`](./ams_laptop/main.rdp) | `0` | primary only |
+| [`left.rdp`](./ams_laptop/left.rdp) | `1` | left (vertical) only |
 | [`1top.rdp`](./ams_laptop/1top.rdp) | `3` | top only |
 | [`1right.rdp`](./ams_laptop/1right.rdp) | `2` | right only |
 | [`middle.rdp`](./ams_laptop/middle.rdp) | `0,3` | primary + top (central column) |
@@ -99,7 +101,7 @@ GUI (`mstsc`) via *Show Options → Save As*.
 
 `selectedmonitors:s:<comma-separated IDs>` — the list of RDP monitor IDs the
 session is stretched across. Everything else (host, resolution, redirection,
-security) is identical across all six files. To make a new layout, copy any
+security) is identical across all the profiles. To make a new layout, copy any
 profile and change only this line.
 
 Supporting fields that make multi-monitor work:
