@@ -141,6 +141,17 @@ function diffStat(dir) {
   return parts.join(" ");
 }
 
+// Which of the machine's Claude profiles this session belongs to, as a single letter.
+// The wrapper functions that split work from personal do it by pointing
+// CLAUDE_CONFIG_DIR at ~/.claude-work or ~/.claude-personal, so the directory's own
+// name already holds the answer and nothing here needs configuring. A machine that
+// runs one profile never sets the variable, lands on plain ~/.claude, and gets no
+// letter — which is the point: there is nothing to switch off over there.
+function profileMark() {
+  const m = /^\.?claude-(.+)$/i.exec(path.basename(CONFIG_DIR));
+  return m ? m[1][0].toUpperCase() : "";
+}
+
 function readCache() {
   try {
     return JSON.parse(fs.readFileSync(CACHE, "utf8"));
@@ -179,8 +190,10 @@ function render(d) {
       `${C.dim}${tokens(cw.total_input_tokens)}/${tokens(cw.context_window_size)}${R}`;
   }
 
-  // Who and where: model, effort, directory, branch.
+  // Who and where: profile, model, effort, directory, branch.
   const tail = [];
+  const mark = profileMark();
+  if (mark) tail.push(`${C.dim}${mark}${R}`);
   const model = d.model && d.model.display_name;
   if (model) tail.push(`${C.model}${model}${R}`);
   if (d.effort && d.effort.level) tail.push(`${C.dim}${d.effort.level}${R}`);

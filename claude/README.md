@@ -6,11 +6,18 @@ countdown to reset.
 
 ```
 5h  34% ━━━───── 2h40m │ 7d  72% ━━━━━━── 4d02h │ ctx  13% ━─────── 128k/1.0M
-Opus 5 · xhigh · extraction-crawler · ⎇ main
+W · Opus 5 · xhigh · extraction-crawler · ⎇ main
 ```
 
 Green under 70%, amber at 70, red at 90 — the same palette and bar glyphs as
 [agtop](https://www.npmjs.com/package/@ldegio/agtop), so the two read as one tool.
+
+The letter opening the second line names the Claude profile the session was launched
+under: `W` for `~/.claude-work`, `P` for `~/.claude-personal` — the first letter of
+whatever follows `claude-` in `CLAUDE_CONFIG_DIR`, so a third profile needs no code.
+A machine that runs a single profile never sets that variable, lands on plain
+`~/.claude`, and gets no letter at all. That is why the same script serves both kinds
+of machine with nothing to configure on either.
 
 ## Install
 
@@ -55,7 +62,7 @@ which moves context onto its own row and keeps every row under ~50 columns:
 ```
 5h  34% ━━━───── 2h40m │ 7d  72% ━━━━━━── 4d02h
 ctx  13% ━─────── 128k/1.0M
-Opus 5 · xhigh · extraction-crawler · ⎇ main
+W · Opus 5 · xhigh · extraction-crawler · ⎇ main
 ```
 
 One consequence worth knowing if you edit the script: Claude Code prepends each line
