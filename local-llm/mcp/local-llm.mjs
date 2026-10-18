@@ -69,7 +69,15 @@ async function isUp() {
   }
 }
 
-async function ensureServer() {
+// Shared so parallel tool calls don't each launch their own router.
+let starting = null;
+
+function ensureServer() {
+  starting ??= startServer().finally(() => (starting = null));
+  return starting;
+}
+
+async function startServer() {
   if (await isUp()) return;
   // Not detached: without a console, Start-Process inside the script silently does nothing.
   spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', START_SCRIPT], {
