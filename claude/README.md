@@ -85,18 +85,39 @@ env file that sets those two variables:
 ```
 
 It gets one row in the same columns: the month's share of the cap, the countdown to
-`budget_reset_at`, then the dollars, and a warning once the key has less than a week
-left (`key 5d`, then `key expired`). With no cap on the key it shows the spend alone.
+`budget_reset_at`, the dollars, the tier, and a warning once the key has less than a
+week left (`key 5d`, then `key expired`). With no cap on the key it shows the spend alone.
 
 ```
-inditex  mo  80% ━━━━━━── 1d23h  │ $480/$600 │ key 5d
+inditex  mo  80% ━━━━━━── 1d23h  │ $480/$600 │ developers │ key 5d
 ```
 
 The figures come from the proxy's `GET /key/info`, which spends nothing, probed detached
 at most every five minutes and cached as `{ spend, max_budget, budget_reset_at, expires,
-at }`. When that fails the row reads `no key` (no `sk-` key in the file), `no url`,
-`offline`, or the HTTP status. `budget_duration` is ignored: some proxies report it
-wrong, and `budget_reset_at` is what counts.
+team_id, models, tpm_limit, rpm_limit, max_parallel_requests, tier, tier_changed, at }`.
+The key and its `key_name` are never cached. When that fails the row reads `no key` (no
+`sk-` key in the file), `no url`, `offline`, or the HTTP status. `budget_duration` is
+ignored: some proxies report it wrong, and `budget_reset_at` is what counts.
+
+#### The tier
+
+Spending the whole monthly budget can earn a higher tier, but no proxy field is called
+that. The row shows what stands for one: the key's team (`developers`), its model group
+when it is not the everyday `developer-models` (shown without the `-models`), and
+`tpm`/`rpm` limits when the key has any. The tag is cut at 21 columns so the session's own
+row, which also carries ctx, stays within about 100.
+
+The probe keeps a fingerprint of team, model groups, cap and limits (`tier`). When a
+probe finds a different one it stamps `tier_changed`, and for the next seven days the tag
+is drawn bold green behind an arrow, so a promotion is hard to miss:
+
+```
+inditex  mo   0% ──────── 30d23h │ $0/$1200 │ ↑ developers senior
+```
+
+The first fingerprint ever seen is not news, and an error keeps the last one, so a
+change across an outage is still caught. `/team/info` is never called: besides the team's
+model list it returns every member's email and key.
 
 A session launched against a proxy (`ANTHROPIC_BASE_URL` set, as `claude-corp` does) gets
 no `rate_limits`. It writes no windows for any account and takes the first LiteLLM row

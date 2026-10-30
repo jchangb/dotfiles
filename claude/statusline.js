@@ -26,10 +26,10 @@
 // A LiteLLM proxy key bills a monthly budget instead of 5h/7d windows. List it as
 //   { "name": "inditex", "litellm": "~/.config/iop/cuenta-alt.env" }
 // (the env file sets ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL) and it gets one row:
-// the month's share of the cap, the reset countdown, then the dollars, read from the
-// proxy's /key/info every 5 minutes. A session launched against a proxy
-// (ANTHROPIC_BASE_URL set) has no rate_limits: it writes no windows and takes the
-// LiteLLM row as its own.
+// the month's share of the cap, the reset countdown, the dollars, then the tier (team,
+// model group, rate limits), read from the proxy's /key/info every 5 minutes. A session
+// launched against a proxy (ANTHROPIC_BASE_URL set) has no rate_limits: it writes no
+// windows and takes the LiteLLM row as its own.
 //
 // The render never shells out. The diff against the remote cannot be read off disk, so
 // it is also left to a detached probe and cached: on a 9p mount (/mnt/c under WSL) it
@@ -59,6 +59,12 @@ const DRIFT_EVERY_MS = 25_000;
 const DRIFT_FRESH_MS = 60_000;
 const DRIFT_TIMEOUT_MS = 5_000;
 const PROBE_MODEL = "claude-haiku-5-5";
+// The model group every Inditex developer key gets; any other is worth showing.
+const EVERYDAY_MODELS = "developer-models";
+const TIER_NEWS_MS = 7 * 86_400_000;
+// Enough for the team and a little more: as the session's own row it shares a line with
+// ctx, and the two must fit in about 100 columns.
+const TIER_W = 21;
 
 const R = "\x1b[0m";
 const C = {
@@ -71,6 +77,7 @@ const C = {
   model: "\x1b[38;5;180m",
   dir: "\x1b[38;5;110m",
   account: "\x1b[1;38;5;180m",
+  news: "\x1b[1;38;5;114m",  // bold green, a tier that changed this week
   // GitHub's two, and the same hues the bars already use. The minus is the bar's
   // red without the bold: a count of deleted lines is not an alarm.
   plus: "\x1b[38;5;114m",
@@ -140,12 +147,38 @@ function budget(e, stale, padTo) {
     out = quota("mo", { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo) +
       SEP + `${C.dim}${usd(e.spend)}/${usd(e.max_budget)}${R}`;
   }
+  const t = tier(e);
+  if (t) out += SEP + t;
   if (keyLeft < 7 * 86_400_000) {
     const days = Math.floor(keyLeft / 86_400_000);
     out += SEP + `${C.amber}key ${days >= 1 ? `${days}d` : countdown(e.expires)}${R}`;
   }
   return out;
 }
+
+// What the proxy files the key under: its team, its model group where that is not the
+// everyday one, and any rate limits. Nothing there is literally called a tier, so this is
+// the closest reading. For a week after any of it or the cap changes it is drawn bold
+// green with an ↑, which is how a promotion for spending the budget would show.
+function tier(e) {
+  const parts = [];
+  if (e.team_id) parts.push(e.team_id);
+  const models = Array.isArray(e.models) ? e.models : [];
+  if (models.length && !(models.length === 1 && models[0] === EVERYDAY_MODELS)) {
+    parts.push(models.map((m) => m.replace(/-models$/, "")).join("+"));
+  }
+  if (e.tpm_limit != null) parts.push(`${tokens(e.tpm_limit)}tpm`);
+  if (e.rpm_limit != null) parts.push(`${e.rpm_limit}rpm`);
+  let tag = parts.join(" ");
+  if (!tag) return "";
+  if (tag.length > TIER_W) tag = `${tag.slice(0, TIER_W - 1)}…`;
+  if (Date.now() - (e.tier_changed || 0) < TIER_NEWS_MS) return `${C.news}↑ ${tag}${R}`;
+  return `${C.dim}${tag}${R}`;
+}
+
+// Everything that makes up a tier, the cap included, in one comparable string.
+const tierPrint = (r) => JSON.stringify([r.team_id, [...(r.models || [])].sort(), r.max_budget,
+  r.tpm_limit, r.rpm_limit, r.max_parallel_requests]);
 
 // Where a directory's repo starts, its branch and the commit it is on, all read straight
 // off disk: spawning git would cost more than the whole render.
@@ -404,16 +437,31 @@ async function probeBudget(account) {
       const ms = Date.parse(iso);
       return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
     };
+    // Picked field by field: the key and its name are never written to the cache.
+    const limit = (n) => (n == null ? null : Number(n));
     result = {
       spend: Number(info.spend) || 0,
-      max_budget: info.max_budget == null ? null : Number(info.max_budget),
+      max_budget: limit(info.max_budget),
       budget_reset_at: epoch(info.budget_reset_at),
       expires: epoch(info.expires),
+      team_id: typeof info.team_id === "string" ? info.team_id.slice(0, 24) : null,
+      models: Array.isArray(info.models) ? info.models.filter((m) => typeof m === "string").slice(0, 8) : [],
+      tpm_limit: limit(info.tpm_limit),
+      rpm_limit: limit(info.rpm_limit),
+      max_parallel_requests: limit(info.max_parallel_requests),
     };
   } catch (e) {
     result = { error: String(e && e.message).slice(0, 20) };
   }
-  patchCache((cache) => { cache[account.name] = { ...result, at: Date.now() }; });
+  // The last tier seen outlives an error, so a change across one is still caught. The
+  // first one ever seen is not news.
+  patchCache((cache) => {
+    const was = cache[account.name] || {};
+    const now = Date.now();
+    const print = result.error ? was.tier : tierPrint(result);
+    const changed = Boolean(was.tier) && print !== was.tier;
+    cache[account.name] = { ...result, at: now, tier: print, tier_changed: changed ? now : was.tier_changed };
+  });
 }
 
 async function probe(name) {
