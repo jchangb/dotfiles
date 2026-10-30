@@ -31,9 +31,9 @@
 // (ANTHROPIC_BASE_URL set) has no rate_limits: it writes no windows and takes the
 // LiteLLM row as its own.
 //
-// The one thing the render does shell out for is the diff against the remote, because
-// there is no reading that off disk. It is bounded by a timeout and rendered at most
-// every `refreshInterval` seconds; measured at 29 ms on a repo of this size.
+// The render never shells out. The diff against the remote cannot be read off disk, so
+// it is also left to a detached probe and cached: on a 9p mount (/mnt/c under WSL) it
+// takes about a second, which is longer than the whole render is allowed to take.
 //
 // Output is multi-line on purpose. Claude Code renders a one-line status with
 // wrap:"truncate" and only splits into a column when the text contains newlines,
@@ -50,8 +50,14 @@ const NARROW = process.argv.includes("--narrow");
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
 const CACHE = path.join(CONFIG_DIR, "statusline-cache.json");
 const ACCOUNTS = path.join(CONFIG_DIR, "statusline.json");
+const DRIFT = path.join(CONFIG_DIR, "statusline-drift.json");
 const PROBE_EVERY_MS = 120_000;
 const BUDGET_EVERY_MS = 300_000;
+// Under the 30 s refreshInterval, so every timed render starts a probe and the next one
+// shows its answer; a minute is then two refreshes of margin before a reading is dropped.
+const DRIFT_EVERY_MS = 25_000;
+const DRIFT_FRESH_MS = 60_000;
+const DRIFT_TIMEOUT_MS = 5_000;
 const PROBE_MODEL = "claude-haiku-5-5";
 
 const R = "\x1b[0m";
@@ -141,8 +147,9 @@ function budget(e, stale, padTo) {
   return out;
 }
 
-// Read HEAD straight off disk; spawning git would cost more than the whole render.
-function branchOf(dir) {
+// Where a directory's repo starts, its branch and the commit it is on, all read straight
+// off disk: spawning git would cost more than the whole render.
+function repoOf(dir) {
   try {
     let d = path.resolve(dir);
     for (let i = 0; i < 16; i++) {
@@ -155,8 +162,9 @@ function branchOf(dir) {
           gitDir = path.resolve(d, m[1].trim());
         }
         const head = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
-        const ref = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
-        return ref ? ref[1] : head.slice(0, 7);
+        const ref = /^ref:\s*(refs\/heads\/(.+))$/.exec(head);
+        if (!ref) return { top: d, branch: head.slice(0, 7), sha: head };
+        return { top: d, branch: ref[2], sha: shaOf(gitDir, ref[1]) };
       }
       const up = path.dirname(d);
       if (up === d) break;
@@ -166,32 +174,84 @@ function branchOf(dir) {
   return null;
 }
 
+// A branch's commit: its loose ref, else its line in packed-refs. A linked worktree keeps
+// its branches in the main repo's git dir, which its `commondir` names. Empty on a branch
+// with no commits yet.
+function shaOf(gitDir, ref) {
+  let common = gitDir;
+  try {
+    common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim());
+  } catch { /* not a linked worktree */ }
+  try {
+    return fs.readFileSync(path.join(common, ref), "utf8").trim();
+  } catch { /* packed */ }
+  try {
+    const packed = fs.readFileSync(path.join(common, "packed-refs"), "utf8");
+    const line = packed.split("\n").find((l) => l.endsWith(` ${ref}`));
+    return line ? line.slice(0, line.indexOf(" ")) : "";
+  } catch {
+    return "";
+  }
+}
+
+// One reading per commit of a branch of a checkout: a new commit, a switch or another
+// worktree is a new key, so a stale count is never shown against the wrong thing.
+const driftKey = (repo) => [repo.top, repo.branch, repo.sha].join("\n");
+
+// Drift has its own file rather than a key in the usage cache: its writers never race
+// the account rows, and an older copy of this script rewriting that cache cannot drop it.
+// Readings past their freshness are pruned on every write, so it never grows.
+function patchDrift(key, change) {
+  const all = readJson(DRIFT) || {};
+  const now = Date.now();
+  for (const [k, e] of Object.entries(all)) {
+    if (now - Math.max(e.at || 0, e.tried || 0) > DRIFT_FRESH_MS) delete all[k];
+  }
+  all[key] = { ...all[key], ...change };
+  writeJson(DRIFT, all);
+}
+
 // How far this working tree is from what is on the remote — **unpushed commits and
 // uncommitted edits in one number**, which is what `git diff @{upstream}` means and what
 // GitHub would show you were you to open a compare. Falls back to the working tree against
 // HEAD where there is no upstream (a local prototype, a detached head), which is the same
 // question with the only answer available.
 //
-// Bounded rather than trusted: a repo big enough to make this slow is exactly the repo
-// where a blocked status line would be noticed, so a timeout draws nothing instead.
-function diffStat(dir) {
-  const shortstat = (against) => {
-    try {
-      const r = spawnSync("git", ["diff", "--shortstat", against], {
-        cwd: dir, encoding: "utf8", timeout: 400, windowsHide: true,
-      });
-      return r.status === 0 ? r.stdout : null;
-    } catch {
-      return null;
-    }
-  };
-  const out = shortstat("@{upstream}") ?? shortstat("HEAD");
-  if (!out) return "";
-  const plus = /(\d+) insertions?\(\+\)/.exec(out);
-  const minus = /(\d+) deletions?\(-\)/.exec(out);
+// Run detached, never by the render. A timeout records no counts rather than falling
+// back: the HEAD diff would quietly answer a different question.
+function probeDrift(top, branch, sha) {
+  const shortstat = (against) => spawnSync("git", ["diff", "--shortstat", against], {
+    cwd: top, encoding: "utf8", timeout: DRIFT_TIMEOUT_MS, windowsHide: true,
+  });
+  let r = shortstat("@{upstream}");
+  if (r.status !== 0 && !r.error && !r.signal) r = shortstat("HEAD");
+  const out = r.status === 0 ? r.stdout : "";
+  const count = (re) => Number((re.exec(out) || [])[1]) || 0;
+  patchDrift(driftKey({ top, branch, sha }), {
+    plus: count(/(\d+) insertions?\(\+\)/),
+    minus: count(/(\d+) deletions?\(-\)/),
+    at: Date.now(),
+  });
+}
+
+// What the last probe for this exact commit found, if it is fresh; starting the next
+// probe when none has been started for it lately.
+function driftOf(repo) {
+  const key = driftKey(repo);
+  const e = (readJson(DRIFT) || {})[key] || {};
+  const now = Date.now();
+  if (now - (e.tried || 0) >= DRIFT_EVERY_MS) {
+    patchDrift(key, { tried: now });
+    spawn(process.execPath, [__filename, "--drift", repo.top, repo.branch, repo.sha], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    }).unref();
+  }
+  if (now - (e.at || 0) > DRIFT_FRESH_MS) return "";
   const parts = [];
-  if (plus) parts.push(`${C.plus}+${plus[1]}${R}`);
-  if (minus) parts.push(`${C.minus}−${minus[1]}${R}`);
+  if (e.plus) parts.push(`${C.plus}+${e.plus}${R}`);
+  if (e.minus) parts.push(`${C.minus}−${e.minus}${R}`);
   // Nothing at all when there is nothing to say: a clean tree is the ordinary state, and
   // "+0 −0" is a row of noise you would learn to stop reading.
   return parts.join(" ");
@@ -216,20 +276,24 @@ function readJson(file) {
   }
 }
 
-const readCache = () => (readJson(CACHE) || {}).accounts || {};
-
-// Every session and probe writes here, so the read-modify-write stays tight and the
-// write lands by rename: a reader never sees half a file.
-function patchCache(change) {
-  const cache = readCache();
-  if (change(cache) === false) return;
-  const tmp = `${CACHE}.${process.pid}`;
+// Every session and probe writes the caches, so each read-modify-write stays tight and
+// the write lands by rename: a reader never sees half a file.
+function writeJson(file, data) {
+  const tmp = `${file}.${process.pid}`;
   try {
-    fs.writeFileSync(tmp, JSON.stringify({ accounts: cache }));
-    fs.renameSync(tmp, CACHE);
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, file);
   } catch {
     try { fs.unlinkSync(tmp); } catch { /* cache is a nicety, never a failure */ }
   }
+}
+
+const readCache = () => (readJson(CACHE) || {}).accounts || {};
+
+function patchCache(change) {
+  const cache = readCache();
+  if (change(cache) === false) return;
+  writeJson(CACHE, { accounts: cache });
 }
 
 const reading = (w) => w && {
@@ -474,13 +538,12 @@ function render(d) {
   const ws = d.workspace || {};
   const dir = (d.worktree && d.worktree.name) || path.basename(ws.current_dir || d.cwd || "");
   if (dir) tail.push(`${C.dir}${dir}${R}`);
-  const here = ws.current_dir || d.cwd || process.cwd();
-  const branch = branchOf(here);
+  const repo = repoOf(ws.current_dir || d.cwd || process.cwd());
   // Joined to the branch rather than given a field of its own: the counts are *about* that
   // branch, and a `·` between them would read as a fourth unrelated thing.
-  if (branch) {
-    const drift = diffStat(here);
-    tail.push(`${C.dim}⎇ ${branch}${R}${drift ? ` ${drift}` : ""}`);
+  if (repo) {
+    const drift = driftOf(repo);
+    tail.push(`${C.dim}⎇ ${repo.branch}${R}${drift ? ` ${drift}` : ""}`);
   }
 
   const lines = NARROW
@@ -507,5 +570,7 @@ function main() {
 }
 
 const probing = process.argv.indexOf("--probe");
-if (probing === -1) main();
-else probe(process.argv[probing + 1]);
+const drifting = process.argv.indexOf("--drift");
+if (probing !== -1) probe(process.argv[probing + 1]);
+else if (drifting !== -1) probeDrift(...process.argv.slice(drifting + 1, drifting + 4));
+else main();

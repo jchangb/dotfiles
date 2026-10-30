@@ -113,6 +113,15 @@ this, which is why they were slow, or stale, or both.
 The git branch is read straight out of `.git/HEAD` rather than by spawning git, which
 matters when the whole render happens every 30 seconds.
 
+The counts after the branch (`⎇ main +12 −3`) are its drift from the remote: unpushed
+commits and uncommitted edits together, as `git diff --shortstat @{upstream}` reports
+them, or against `HEAD` where the branch has no upstream. That one cannot be read off
+disk, and on a repo under `/mnt/c` in WSL it takes about a second, so the render never
+runs it. A detached copy of the script does, at most every 25 seconds per commit and
+with a 5-second limit, and the render shows its answer only while it is under a minute
+old and still about the same branch and commit. A new commit shows no counts for one
+refresh; a clean tree never shows any.
+
 ## Three things that cost an afternoon to find out
 
 **`CLAUDE_CONFIG_DIR` decides which `settings.json` is read.** If you launch through
@@ -162,3 +171,7 @@ redraw the last known value marked `~` until the real numbers land. Readings are
 by account name and merged by the rule that usage only climbs inside a window: the
 later window wins, or in the same window the higher figure. So a session idling on an
 old snapshot never overwrites a fresher one, and no two clocks need to agree.
+
+Beside it, `statusline-drift.json` holds the last drift reading per checkout, branch and
+commit. It is a file of its own so that its writers never race the quota rows, and
+readings are pruned once they are too old to show, so it stays a few lines long.
