@@ -43,6 +43,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { spawn, spawnSync } = require("child_process");
 
 const NARROW = process.argv.includes("--narrow");
@@ -245,6 +246,25 @@ function newer(a, b) {
   return b.used_percentage > a.used_percentage ? b : a;
 }
 
+// Who a row's windows belong to. After a /login to another account the row keeps its
+// name, and the old account's later window would win newer() until it resets.
+function ownerOf(account) {
+  try {
+    if (account && account.credentials) {
+      const dir = path.dirname(expandHome(account.credentials));
+      const file = dir === path.join(os.homedir(), ".claude") ? path.join(os.homedir(), ".claude.json") : path.join(dir, ".claude.json");
+      return ((readJson(file) || {}).oauthAccount || {}).accountUuid || "";
+    }
+    if (account && account.envFile) {
+      const token = envValue(account.envFile, "CLAUDE_CODE_OAUTH_TOKEN");
+      return token ? crypto.createHash("sha256").update(token).digest("hex").slice(0, 12) : "";
+    }
+  } catch { /* unknown owner: keep what is cached */ }
+  return "";
+}
+
+const ownedBy = (entry, who) => (!entry || (who && entry.who && entry.who !== who) ? {} : entry);
+
 function loadAccounts() {
   const list = (readJson(ACCOUNTS) || {}).accounts;
   return Array.isArray(list) ? list.filter((a) => a && a.name) : [];
@@ -364,12 +384,14 @@ async function probe(name) {
   } catch (e) {
     result = { error: String(e && e.message).slice(0, 40) };
   }
+  const who = ownerOf(account);
   patchCache((cache) => {
-    const was = cache[name] || {};
+    const was = ownedBy(cache[name], who);
     cache[name] = result.error ? { ...was, error: result.error } : {
       five_hour: newer(was.five_hour, result.five_hour),
       seven_day: newer(was.seven_day, result.seven_day),
       at: Date.now(),
+      who: who || was.who,
     };
   });
 }
@@ -394,17 +416,18 @@ function render(d) {
   const mineBudget = accounts.find((a) => a.name === mine && isBudget(a));
   const onProxy = Boolean(process.env.ANTHROPIC_BASE_URL || mineBudget);
   const live = (!onProxy && d.rate_limits) || {};
+  const who = mineBudget ? "" : ownerOf(accounts.find((a) => a.name === mine));
   if (live.five_hour || live.seven_day) {
     patchCache((cache) => {
-      const was = cache[mine] || {};
+      const was = ownedBy(cache[mine], who);
       const five = newer(was.five_hour, reading(live.five_hour));
       const seven = newer(was.seven_day, reading(live.seven_day));
-      if (five === was.five_hour && seven === was.seven_day) return false;
-      cache[mine] = { five_hour: five, seven_day: seven, at: Date.now() };
+      if (five === was.five_hour && seven === was.seven_day && (!who || was.who === who)) return false;
+      cache[mine] = { five_hour: five, seven_day: seven, at: Date.now(), who: who || was.who };
     });
   }
   const cache = readCache();
-  const own = cache[mine] || {};
+  const own = ownedBy(cache[mine], who);
   const others = accounts.filter((a) => a.name !== mine);
   // No session feeds a budget row, so this session's own one is probed too.
   others.concat(mineBudget || []).forEach((a) => probeIfStale(a, cache[a.name] || {}));
@@ -426,7 +449,7 @@ function render(d) {
       rows.push(budgetRow(a, C.dim));
       continue;
     }
-    const e = cache[a.name] || {};
+    const e = ownedBy(cache[a.name], ownerOf(a));
     const stale = Boolean(e.error) || Date.now() - (e.at || 0) > 2 * PROBE_EVERY_MS;
     rows.push(row(a.name, C.dim, e.five_hour, e.seven_day, stale, stale));
   }
