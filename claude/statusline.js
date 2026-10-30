@@ -3,15 +3,37 @@
 
 // Claude Code status line: 5h window, 7d window, context — bars in agtop's palette.
 //
-// Everything drawn here arrives on stdin from Claude Code itself (2.1.x): the
-// rate_limits block is authoritative and needs no API call, so this script never
-// touches the network. When a window is missing (the payload only carries
-// rate_limits after the session's first API response) the last seen value is
-// redrawn with a "~" so the bar does not blink out mid-conversation.
+// Everything drawn for this session arrives on stdin from Claude Code itself (2.1.x):
+// the rate_limits block is authoritative and needs no API call. When a window is
+// missing (the payload only carries rate_limits after the session's first API
+// response) the last seen value is redrawn with a "~" so the bar does not blink out
+// mid-conversation.
 //
-// The one thing it does shell out for is the diff against the remote, because
-// there is no reading that off disk. It is bounded by a timeout and rendered at
-// most every `refreshInterval` seconds; measured at 29 ms on a repo of this size.
+// Several accounts can share one config dir (a stored login plus setup-token
+// launchers). List them in statusline.json beside settings.json and each gets a
+// named row, this session's first:
+//
+//   { "accounts": [
+//       { "name": "work", "credentials": "~/.claude/.credentials.json" },
+//       { "name": "work-alt", "envFile": "~/.config/claude-accounts/alt.env" } ] }
+//
+// CLAUDE_ACCOUNT names this session's account; unset, it is the stored login's. The
+// other rows come from the cache, which every session of an account feeds with what
+// it sees. When one goes stale, a detached copy of this script spends a 1-token
+// request on that account to read its rate-limit headers, so the render itself never
+// touches the network. Without statusline.json nothing is probed.
+//
+// A LiteLLM proxy key bills a monthly budget instead of 5h/7d windows. List it as
+//   { "name": "inditex", "litellm": "~/.config/iop/cuenta-alt.env" }
+// (the env file sets ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL) and it gets one row:
+// the month's share of the cap, the reset countdown, then the dollars, read from the
+// proxy's /key/info every 5 minutes. A session launched against a proxy
+// (ANTHROPIC_BASE_URL set) has no rate_limits: it writes no windows and takes the
+// LiteLLM row as its own.
+//
+// The one thing the render does shell out for is the diff against the remote, because
+// there is no reading that off disk. It is bounded by a timeout and rendered at most
+// every `refreshInterval` seconds; measured at 29 ms on a repo of this size.
 //
 // Output is multi-line on purpose. Claude Code renders a one-line status with
 // wrap:"truncate" and only splits into a column when the text contains newlines,
@@ -21,11 +43,15 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const NARROW = process.argv.includes("--narrow");
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
 const CACHE = path.join(CONFIG_DIR, "statusline-cache.json");
+const ACCOUNTS = path.join(CONFIG_DIR, "statusline.json");
+const PROBE_EVERY_MS = 120_000;
+const BUDGET_EVERY_MS = 300_000;
+const PROBE_MODEL = "claude-haiku-5-5";
 
 const R = "\x1b[0m";
 const C = {
@@ -37,6 +63,7 @@ const C = {
   red: "\x1b[1;38;5;203m",
   model: "\x1b[38;5;180m",
   dir: "\x1b[38;5;110m",
+  account: "\x1b[1;38;5;180m",
   // GitHub's two, and the same hues the bars already use. The minus is the bar's
   // red without the bold: a count of deleted lines is not an alarm.
   plus: "\x1b[38;5;114m",
@@ -75,14 +102,42 @@ function tokens(n) {
   return String(n);
 }
 
-function quota(label, w, stale) {
-  if (!w) return `${C.dim}${label}   --${R}`;
-  const pct = Math.round(w.used_percentage ?? 0);
-  const color = tone(pct);
-  const mark = stale ? `${C.dim}~${R}` : " ";
-  const left = countdown(w.resets_at);
-  return `${C.label}${label}${R} ${color}${String(pct).padStart(3)}%${R}${mark}${bar(pct, color)}` +
+// padTo keeps the separators of stacked account rows in one column.
+function quota(label, w, stale, padTo = 0) {
+  const pct = w ? Math.round(w.used_percentage ?? 0) : 0;
+  const color = w ? tone(pct) : C.dim;
+  const figure = w ? `${String(pct).padStart(3)}%` : "  --";
+  const mark = w && stale ? `${C.dim}~${R}` : " ";
+  const left = (w ? countdown(w.resets_at) : "").padEnd(padTo);
+  return `${C.label}${label}${R} ${color}${figure}${R}${mark}${bar(pct, color)}` +
     (left ? ` ${C.dim}${left}${R}` : "");
+}
+
+const usd = (n) => "$" + (Number.isInteger(n) || n >= 100 ? String(Math.round(n)) : n.toFixed(2));
+
+// A LiteLLM budget in the same columns as a 5h/7d row: the month's share of the cap
+// and its reset countdown, then the dollars, then a warning once the key has less
+// than a week to live. An error reads as itself.
+function budget(e, stale, padTo) {
+  const keyLeft = e.expires ? e.expires * 1000 - Date.now() : Infinity;
+  if (keyLeft <= 0) return `${C.red}key expired${R}`;
+  if (e.error) return `${C.dim}${/^\d+$/.test(e.error) ? `HTTP ${e.error}` : e.error}${R}`;
+  let out;
+  if (e.spend == null) {
+    out = quota("mo", null, false, padTo);
+  } else if (e.max_budget == null) {
+    const left = countdown(e.budget_reset_at);
+    out = `${C.label}mo${R} ${C.dim}${usd(e.spend)}${stale ? "~" : ""}${left ? ` ${left}` : ""}${R}`;
+  } else {
+    const pct = e.max_budget > 0 ? (e.spend / e.max_budget) * 100 : 100;
+    out = quota("mo", { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo) +
+      SEP + `${C.dim}${usd(e.spend)}/${usd(e.max_budget)}${R}`;
+  }
+  if (keyLeft < 7 * 86_400_000) {
+    const days = Math.floor(keyLeft / 86_400_000);
+    out += SEP + `${C.amber}key ${days >= 1 ? `${days}d` : countdown(e.expires)}${R}`;
+  }
+  return out;
 }
 
 // Read HEAD straight off disk; spawning git would cost more than the whole render.
@@ -152,33 +207,229 @@ function profileMark() {
   return m ? m[1][0].toUpperCase() : "";
 }
 
-function readCache() {
+function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(CACHE, "utf8"));
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
-    return {};
+    return null;
   }
 }
 
-function writeCache(obj) {
+const readCache = () => (readJson(CACHE) || {}).accounts || {};
+
+// Every session and probe writes here, so the read-modify-write stays tight and the
+// write lands by rename: a reader never sees half a file.
+function patchCache(change) {
+  const cache = readCache();
+  if (change(cache) === false) return;
+  const tmp = `${CACHE}.${process.pid}`;
   try {
-    fs.writeFileSync(CACHE, JSON.stringify(obj));
-  } catch { /* cache is a nicety, never a failure */ }
+    fs.writeFileSync(tmp, JSON.stringify({ accounts: cache }));
+    fs.renameSync(tmp, CACHE);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* cache is a nicety, never a failure */ }
+  }
+}
+
+const reading = (w) => w && {
+  used_percentage: w.used_percentage ?? 0,
+  resets_at: w.resets_at > 1e12 ? Math.floor(w.resets_at / 1000) : w.resets_at || 0,
+};
+
+// Usage only climbs inside a window, so of two readings the later window wins, or in
+// the same window the higher figure. No clocks have to agree, and a session idling on
+// an old snapshot can never overwrite a fresher one.
+function newer(a, b) {
+  if (!a || !b) return a || b;
+  if (Math.abs(a.resets_at - b.resets_at) > 60) return a.resets_at > b.resets_at ? a : b;
+  return b.used_percentage > a.used_percentage ? b : a;
+}
+
+function loadAccounts() {
+  const list = (readJson(ACCOUNTS) || {}).accounts;
+  return Array.isArray(list) ? list.filter((a) => a && a.name) : [];
+}
+
+const isBudget = (account) => Boolean(account && account.litellm);
+const probeEvery = (account) => (isBudget(account) ? BUDGET_EVERY_MS : PROBE_EVERY_MS);
+
+// A label the list does not know (a session launched before a rename) is ignored, so
+// it never adds a row of its own.
+function currentAccount(accounts) {
+  const named = process.env.CLAUDE_ACCOUNT;
+  if (named && (!accounts.length || accounts.some((a) => a.name === named))) return named;
+  if (process.env.ANTHROPIC_BASE_URL) return (accounts.find(isBudget) || { name: "" }).name;
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return "";
+  const stored = accounts.find((a) => a.credentials);
+  return stored ? stored.name : "";
+}
+
+const expandHome = (p) => p.replace(/^~(?=$|[\\/])/, os.homedir());
+
+// The last assignment wins, as when the shell sources the file.
+function envValue(file, name) {
+  const env = fs.readFileSync(expandHome(file), "utf8");
+  const re = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${name}=[ \\t]*(?:'([^']*)'|"([^"]*)"|([^\\s#]*))`, "gm");
+  let value = "";
+  for (const m of env.matchAll(re)) value = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+  return value;
+}
+
+function tokenOf(account) {
+  let token;
+  if (account.credentials) {
+    const oauth = (readJson(expandHome(account.credentials)) || {}).claudeAiOauth || {};
+    if (oauth.expiresAt < Date.now()) throw new Error("login expired");
+    token = oauth.accessToken;
+  } else {
+    token = envValue(account.envFile, "CLAUDE_CODE_OAUTH_TOKEN");
+  }
+  if (!token) throw new Error("no token");
+  return token;
+}
+
+// /key/info reports the key's spend, cap and reset without spending anything. Errors
+// are stored as the row should read them: no key, no url, offline, or the HTTP status.
+async function probeBudget(account) {
+  let result;
+  try {
+    let token, base;
+    try {
+      token = envValue(account.litellm, "ANTHROPIC_AUTH_TOKEN");
+      base = envValue(account.litellm, "ANTHROPIC_BASE_URL").replace(/\/+$/, "");
+    } catch {
+      throw new Error("no key");
+    }
+    if (!token.startsWith("sk-")) throw new Error("no key");
+    if (!/^https?:\/\/[^<>\s]+$/.test(base)) throw new Error("no url");
+    let res;
+    try {
+      res = await fetch(`${base}/key/info`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch {
+      throw new Error("offline");
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    const body = await res.json();
+    const info = body.info || body;
+    // budget_duration is not trusted (the Inditex proxy reports "2d" for a monthly
+    // budget); budget_reset_at is. Keys expire about monthly and must be regenerated.
+    const epoch = (iso) => {
+      const ms = Date.parse(iso);
+      return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+    };
+    result = {
+      spend: Number(info.spend) || 0,
+      max_budget: info.max_budget == null ? null : Number(info.max_budget),
+      budget_reset_at: epoch(info.budget_reset_at),
+      expires: epoch(info.expires),
+    };
+  } catch (e) {
+    result = { error: String(e && e.message).slice(0, 20) };
+  }
+  patchCache((cache) => { cache[account.name] = { ...result, at: Date.now() }; });
+}
+
+async function probe(name) {
+  const account = loadAccounts().find((a) => a.name === name);
+  if (isBudget(account)) return probeBudget(account);
+  let result;
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal: AbortSignal.timeout(20_000),
+      headers: {
+        authorization: `Bearer ${tokenOf(account)}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: PROBE_MODEL,
+        max_tokens: 1,
+        // Subscription tokens are only served to requests that identify as Claude Code.
+        system: "You are Claude Code, Anthropic's official CLI for Claude.",
+        messages: [{ role: "user", content: "." }],
+      }),
+    });
+    const header = (win, field) => res.headers.get(`anthropic-ratelimit-unified-${win}-${field}`);
+    if (header("5h", "utilization") == null) throw new Error(`HTTP ${res.status}`);
+    const windowOf = (win) => ({
+      used_percentage: Math.round(header(win, "utilization") * 1000) / 10,
+      resets_at: Number(header(win, "reset")) || 0,
+    });
+    result = { five_hour: windowOf("5h"), seven_day: windowOf("7d") };
+  } catch (e) {
+    result = { error: String(e && e.message).slice(0, 40) };
+  }
+  patchCache((cache) => {
+    const was = cache[name] || {};
+    cache[name] = result.error ? { ...was, error: result.error } : {
+      five_hour: newer(was.five_hour, result.five_hour),
+      seven_day: newer(was.seven_day, result.seven_day),
+      at: Date.now(),
+    };
+  });
+}
+
+function probeIfStale(account, entry) {
+  const now = Date.now();
+  if (!account.credentials && !account.envFile && !account.litellm) return;
+  if (now - Math.max(entry.at || 0, entry.tried || 0) < probeEvery(account)) return;
+  patchCache((cache) => { cache[account.name] = { ...cache[account.name], tried: now }; });
+  spawn(process.execPath, [__filename, "--probe", account.name], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  }).unref();
 }
 
 function render(d) {
-  // The two subscription windows, falling back to the last values we saw.
-  const cache = readCache();
-  const live = d.rate_limits || {};
-  const five = live.five_hour || cache.five_hour;
-  const seven = live.seven_day || cache.seven_day;
+  // This session's windows, folded into what every other session of the account saw.
+  // A session on a proxy has no subscription windows and must never write any.
+  const accounts = loadAccounts();
+  const mine = currentAccount(accounts);
+  const mineBudget = accounts.find((a) => a.name === mine && isBudget(a));
+  const onProxy = Boolean(process.env.ANTHROPIC_BASE_URL || mineBudget);
+  const live = (!onProxy && d.rate_limits) || {};
   if (live.five_hour || live.seven_day) {
-    writeCache({
-      five_hour: live.five_hour || cache.five_hour,
-      seven_day: live.seven_day || cache.seven_day,
+    patchCache((cache) => {
+      const was = cache[mine] || {};
+      const five = newer(was.five_hour, reading(live.five_hour));
+      const seven = newer(was.seven_day, reading(live.seven_day));
+      if (five === was.five_hour && seven === was.seven_day) return false;
+      cache[mine] = { five_hour: five, seven_day: seven, at: Date.now() };
     });
   }
-  const limits = [quota("5h", five, !live.five_hour), quota("7d", seven, !live.seven_day)];
+  const cache = readCache();
+  const own = cache[mine] || {};
+  const others = accounts.filter((a) => a.name !== mine);
+  // No session feeds a budget row, so this session's own one is probed too.
+  others.concat(mineBudget || []).forEach((a) => probeIfStale(a, cache[a.name] || {}));
+
+  const width = Math.max(mine.length, ...others.map((a) => a.name.length));
+  const pad = others.length ? 6 : 0;
+  const lead = (name, color) => (width ? `${color}${name.padEnd(width)}${R} ` : "");
+  const row = (name, color, five, seven, stale5, stale7) =>
+    lead(name, color) + quota("5h", five, stale5, pad) + SEP + quota("7d", seven, stale7);
+  const budgetRow = (a, color) => {
+    const e = cache[a.name] || {};
+    return lead(a.name, color) + budget(e, Date.now() - (e.at || 0) > 2 * BUDGET_EVERY_MS, pad);
+  };
+  const rows = [mineBudget ? budgetRow(mineBudget, C.account) : row(mine, C.account,
+    newer(reading(live.five_hour), own.five_hour), newer(reading(live.seven_day), own.seven_day),
+    !live.five_hour, !live.seven_day)];
+  for (const a of others) {
+    if (isBudget(a)) {
+      rows.push(budgetRow(a, C.dim));
+      continue;
+    }
+    const e = cache[a.name] || {};
+    const stale = Boolean(e.error) || Date.now() - (e.at || 0) > 2 * PROBE_EVERY_MS;
+    rows.push(row(a.name, C.dim, e.five_hour, e.seven_day, stale, stale));
+  }
 
   // Context, as a share of this model's window.
   const cw = d.context_window;
@@ -210,22 +461,28 @@ function render(d) {
   }
 
   const lines = NARROW
-    ? [limits.join(SEP), ctx, tail.join(DOT)]
-    : [limits.concat(ctx || []).join(SEP), tail.join(DOT)];
+    ? [...rows, ctx, tail.join(DOT)]
+    : [[rows[0]].concat(ctx || []).join(SEP), ...rows.slice(1), tail.join(DOT)];
   return lines.filter(Boolean);
 }
 
-let raw = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (c) => (raw += c));
-process.stdin.on("end", () => {
-  let lines;
-  try {
-    lines = render(JSON.parse(raw));
-  } catch (e) {
-    lines = [`${C.dim}statusline: ${String(e && e.message).slice(0, 60)}${R}`];
-  }
-  // Every line self-terminates its colour: Claude Code prepends each line with the
-  // escape codes accumulated from the ones above it, so an unclosed span would bleed.
-  process.stdout.write(lines.map((l) => l + R).join("\n") + "\n");
-});
+function main() {
+  let raw = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (c) => (raw += c));
+  process.stdin.on("end", () => {
+    let lines;
+    try {
+      lines = render(JSON.parse(raw));
+    } catch (e) {
+      lines = [`${C.dim}statusline: ${String(e && e.message).slice(0, 60)}${R}`];
+    }
+    // Every line self-terminates its colour: Claude Code prepends each line with the
+    // escape codes accumulated from the ones above it, so an unclosed span would bleed.
+    process.stdout.write(lines.map((l) => l + R).join("\n") + "\n");
+  });
+}
+
+const probing = process.argv.indexOf("--probe");
+if (probing === -1) main();
+else probe(process.argv[probing + 1]);
