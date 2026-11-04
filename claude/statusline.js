@@ -23,13 +23,17 @@
 // request on that account to read its rate-limit headers, so the render itself never
 // touches the network. Without statusline.json nothing is probed.
 //
-// A LiteLLM proxy key bills a monthly budget instead of 5h/7d windows. List it as
+// A LiteLLM proxy key bills a budget per period instead of 5h/7d windows. List it as
 //   { "name": "inditex", "litellm": "~/.config/iop/cuenta-alt.env" }
 // (the env file sets ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL) and it gets one row:
-// the month's share of the cap, the reset countdown, the dollars, then the tier (team,
+// the period's share of the cap, the reset countdown, the dollars, then the tier (team,
 // model group, rate limits), read from the proxy's /key/info every 5 minutes. A session
 // launched against a proxy (ANTHROPIC_BASE_URL set) has no rate_limits: it writes no
 // windows and takes the LiteLLM row as its own.
+//
+// A GitHub Copilot seat's monthly AI credits get the same kind of row with
+//   { "name": "copilot", "copilot": true }
+// read every 5 minutes through the gh login, in dollars, with the Inditex tier.
 //
 // The render never shells out. The diff against the remote cannot be read off disk, so
 // it is also left to a detached probe and cached: on a 9p mount (/mnt/c under WSL) it
@@ -129,22 +133,23 @@ function quota(label, w, stale, padTo = 0) {
 
 const usd = (n) => "$" + (Number.isInteger(n) || n >= 100 ? String(Math.round(n)) : n.toFixed(2));
 
-// A LiteLLM budget in the same columns as a 5h/7d row: the month's share of the cap
-// and its reset countdown, then the dollars, then a warning once the key has less
-// than a week to live. An error reads as itself.
+// A budget in the same columns as a 5h/7d row: the period's share of the cap and its
+// reset countdown, then the dollars, then a warning once the key has less than a week
+// to live. An error reads as itself.
 function budget(e, stale, padTo) {
   const keyLeft = e.expires ? e.expires * 1000 - Date.now() : Infinity;
   if (keyLeft <= 0) return `${C.red}key expired${R}`;
   if (e.error) return `${C.dim}${/^\d+$/.test(e.error) ? `HTTP ${e.error}` : e.error}${R}`;
+  const period = e.period || "mo";
   let out;
   if (e.spend == null) {
-    out = quota("mo", null, false, padTo);
+    out = quota(period, null, false, padTo);
   } else if (e.max_budget == null) {
     const left = countdown(e.budget_reset_at);
-    out = `${C.label}mo${R} ${C.dim}${usd(e.spend)}${stale ? "~" : ""}${left ? ` ${left}` : ""}${R}`;
+    out = `${C.label}${period}${R} ${C.dim}${usd(e.spend)}${stale ? "~" : ""}${left ? ` ${left}` : ""}${R}`;
   } else {
     const pct = e.max_budget > 0 ? (e.spend / e.max_budget) * 100 : 100;
-    out = quota("mo", { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo) +
+    out = quota(period, { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo) +
       SEP + `${C.dim}${usd(e.spend)}/${usd(e.max_budget)}${R}`;
   }
   const t = tier(e);
@@ -162,6 +167,7 @@ function budget(e, stale, padTo) {
 // green with an ↑, which is how a promotion for spending the budget would show.
 function tier(e) {
   const parts = [];
+  if (e.tag) parts.push(e.tag);
   if (e.team_id) parts.push(e.team_id);
   const models = Array.isArray(e.models) ? e.models : [];
   if (models.length && !(models.length === 1 && models[0] === EVERYDAY_MODELS)) {
@@ -178,7 +184,7 @@ function tier(e) {
 
 // Everything that makes up a tier, the cap included, in one comparable string.
 const tierPrint = (r) => JSON.stringify([r.team_id, [...(r.models || [])].sort(), r.max_budget,
-  r.tpm_limit, r.rpm_limit, r.max_parallel_requests]);
+  r.tpm_limit, r.rpm_limit, r.max_parallel_requests].concat(r.tag ? [r.tag] : []));
 
 // Where a directory's repo starts, its branch and the commit it is on, all read straight
 // off disk: spawning git would cost more than the whole render.
@@ -368,7 +374,8 @@ function loadAccounts() {
 }
 
 const isBudget = (account) => Boolean(account && account.litellm);
-const probeEvery = (account) => (isBudget(account) ? BUDGET_EVERY_MS : PROBE_EVERY_MS);
+const isCopilot = (account) => Boolean(account && account.copilot);
+const probeEvery = (account) => (isBudget(account) || isCopilot(account) ? BUDGET_EVERY_MS : PROBE_EVERY_MS);
 
 // A label the list does not know (a session launched before a rename) is ignored, so
 // it never adds a row of its own.
@@ -431,18 +438,15 @@ async function probeBudget(account) {
     if (!res.ok) throw new Error(String(res.status));
     const body = await res.json();
     const info = body.info || body;
-    // budget_duration is not trusted (the Inditex proxy reports "2d" for a monthly
-    // budget); budget_reset_at is. Keys expire about monthly and must be regenerated.
-    const epoch = (iso) => {
-      const ms = Date.parse(iso);
-      return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
-    };
+    // budget_duration holds: the Inditex key reports "2d" and its budget did reset on
+    // 1, 3 and 5 Nov 2026, not monthly. Keys expire about monthly and must be regenerated.
     // Picked field by field: the key and its name are never written to the cache.
     const limit = (n) => (n == null ? null : Number(n));
     result = {
       spend: Number(info.spend) || 0,
       max_budget: limit(info.max_budget),
       budget_reset_at: epoch(info.budget_reset_at),
+      period: periodOf(info.budget_duration),
       expires: epoch(info.expires),
       team_id: typeof info.team_id === "string" ? info.team_id.slice(0, 24) : null,
       models: Array.isArray(info.models) ? info.models.filter((m) => typeof m === "string").slice(0, 8) : [],
@@ -453,8 +457,39 @@ async function probeBudget(account) {
   } catch (e) {
     result = { error: String(e && e.message).slice(0, 20) };
   }
-  // The last tier seen outlives an error, so a change across one is still caught. The
-  // first one ever seen is not news.
+  saveBudget(account, result);
+}
+
+// The seat's premium credits, from the endpoint the editors read their own quota from
+// (undocumented), through gh so no token is handled here. A credit is a cent. Inditex
+// sets the entitlement by tier: $500 at T0 and $500 more per tier, plus a $100 margin.
+async function probeCopilot(account) {
+  let result;
+  try {
+    const out = spawnSync("gh", ["api", "/copilot_internal/user"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+    if (out.error) throw new Error("no gh");
+    if (out.status !== 0) throw new Error("gh failed");
+    const user = JSON.parse(out.stdout);
+    const q = (user.quota_snapshots || {}).premium_interactions;
+    if (!q) throw new Error("no quota");
+    const cap = q.entitlement / 100;
+    const step = (cap - 600) / 500;
+    result = {
+      spend: Math.max(0, q.entitlement - q.remaining) / 100,
+      max_budget: q.unlimited ? null : cap,
+      budget_reset_at: epoch(user.quota_reset_date_utc),
+      period: "mo",
+      tag: Number.isInteger(step) && step >= 0 && step <= 3 ? `T${step}` : null,
+    };
+  } catch (e) {
+    result = { error: String(e && e.message).slice(0, 20) };
+  }
+  saveBudget(account, result);
+}
+
+// The last tier seen outlives an error, so a change across one is still caught. The
+// first one ever seen is not news.
+function saveBudget(account, result) {
   patchCache((cache) => {
     const was = cache[account.name] || {};
     const now = Date.now();
@@ -464,9 +499,24 @@ async function probeBudget(account) {
   });
 }
 
+function epoch(iso) {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+// A budget_duration ("2d", "30d", "1mo") as a window label: a month or more reads "mo",
+// anything shorter as itself.
+function periodOf(duration) {
+  const m = /^(\d+)\s*(mo|[smhd])$/.exec(String(duration || "").trim());
+  if (!m) return "mo";
+  const days = m[2] === "mo" ? 30 * m[1] : m[2] === "d" ? Number(m[1]) : 0;
+  return days >= 28 ? "mo" : `${m[1]}${m[2]}`;
+}
+
 async function probe(name) {
   const account = loadAccounts().find((a) => a.name === name);
   if (isBudget(account)) return probeBudget(account);
+  if (isCopilot(account)) return probeCopilot(account);
   let result;
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -510,7 +560,7 @@ async function probe(name) {
 
 function probeIfStale(account, entry) {
   const now = Date.now();
-  if (!account.credentials && !account.envFile && !account.litellm) return;
+  if (!account.credentials && !account.envFile && !account.litellm && !account.copilot) return;
   if (now - Math.max(entry.at || 0, entry.tried || 0) < probeEvery(account)) return;
   patchCache((cache) => { cache[account.name] = { ...cache[account.name], tried: now }; });
   spawn(process.execPath, [__filename, "--probe", account.name], {
@@ -557,7 +607,7 @@ function render(d) {
     newer(reading(live.five_hour), own.five_hour), newer(reading(live.seven_day), own.seven_day),
     !live.five_hour, !live.seven_day)];
   for (const a of others) {
-    if (isBudget(a)) {
+    if (isBudget(a) || isCopilot(a)) {
       rows.push(budgetRow(a, C.dim));
       continue;
     }
