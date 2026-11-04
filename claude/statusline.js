@@ -466,8 +466,9 @@ async function probeBudget(account) {
 async function probeCopilot(account) {
   let result;
   try {
-    const out = spawnSync("gh", ["api", "/copilot_internal/user"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
-    if (out.error) throw new Error("no gh");
+    // Detached, so a slow gh (30 s on the VPN at times) costs the render nothing.
+    const out = spawnSync("gh", ["api", "/copilot_internal/user"], { encoding: "utf8", timeout: 60_000, windowsHide: true });
+    if (out.error) throw new Error(out.error.code === "ENOENT" ? "no gh" : "offline");
     if (out.status !== 0) throw new Error("gh failed");
     const user = JSON.parse(out.stdout);
     const q = (user.quota_snapshots || {}).premium_interactions;
