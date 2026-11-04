@@ -24,7 +24,7 @@
 // touches the network. Without statusline.json nothing is probed.
 //
 // A LiteLLM proxy key bills a budget per period instead of 5h/7d windows. List it as
-//   { "name": "inditex", "litellm": "~/.config/iop/cuenta-alt.env" }
+//   { "name": "itx-litellm", "litellm": "~/.config/iop/cuenta-alt.env" }
 // (the env file sets ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL) and it gets one row:
 // the period's share of the cap, the reset countdown, the dollars, then the tier (team,
 // model group, rate limits), read from the proxy's /key/info every 5 minutes. A session
@@ -32,7 +32,7 @@
 // windows and takes the LiteLLM row as its own.
 //
 // A GitHub Copilot seat's monthly AI credits get the same kind of row with
-//   { "name": "copilot", "copilot": true }
+//   { "name": "itx-copilot", "copilot": true }
 // read every 5 minutes through the gh login, in dollars, with the Inditex tier.
 //
 // The render never shells out. The diff against the remote cannot be read off disk, so
