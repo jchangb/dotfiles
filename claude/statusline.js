@@ -99,11 +99,15 @@ function bar(pct, color) {
   return color + "━".repeat(filled) + C.track + "─".repeat(BAR_W - filled) + R;
 }
 
-// "2h41m" under a day, "4d03h" over one — always the two largest units.
 function countdown(resetsAt) {
   if (!resetsAt) return "";
   const ms = (resetsAt > 1e12 ? resetsAt : resetsAt * 1000) - Date.now();
   if (ms <= 0) return "now";
+  return span(ms);
+}
+
+// "2h41m" under a day, "4d03h" over one — always the two largest units.
+function span(ms) {
   const mins = Math.floor(ms / 60000);
   const d = Math.floor(mins / 1440);
   const h = Math.floor((mins % 1440) / 60);
@@ -121,9 +125,9 @@ function tokens(n) {
 }
 
 // padTo keeps the separators of stacked account rows in one column.
-function quota(label, w, stale, padTo = 0) {
+function quota(label, w, stale, padTo = 0, muted = false) {
   const pct = w ? Math.round(w.used_percentage ?? 0) : 0;
-  const color = w ? tone(pct) : C.dim;
+  const color = w && !muted ? tone(pct) : C.dim;
   const figure = w ? `${String(pct).padStart(3)}%` : "  --";
   const mark = w && stale ? `${C.dim}~${R}` : " ";
   const left = (w ? countdown(w.resets_at) : "").padEnd(padTo);
@@ -135,11 +139,13 @@ const usd = (n) => "$" + (Number.isInteger(n) || n >= 100 ? String(Math.round(n)
 
 // A budget in the same columns as a 5h/7d row: the period's share of the cap and its
 // reset countdown, then the dollars, then a warning once the key has less than a week
-// to live. An error reads as itself.
+// to live. An error reads as itself. Figures from an earlier read survive it, drawn without
+// their tone so they cannot pass for current, and the error says how old they are.
 function budget(e, stale, padTo) {
   const keyLeft = e.expires ? e.expires * 1000 - Date.now() : Infinity;
   if (keyLeft <= 0) return `${C.red}key expired${R}`;
-  if (e.error) return `${C.dim}${/^\d+$/.test(e.error) ? `HTTP ${e.error}` : e.error}${R}`;
+  const why = e.error && (/^\d+$/.test(e.error) ? `HTTP ${e.error}` : e.error);
+  if (why && e.spend == null) return `${C.dim}${why}${R}`;
   const period = e.period || "mo";
   let out;
   if (e.spend == null) {
@@ -149,11 +155,12 @@ function budget(e, stale, padTo) {
     out = `${C.label}${period}${R} ${C.dim}${usd(e.spend)}${stale ? "~" : ""}${left ? ` ${left}` : ""}${R}`;
   } else {
     const pct = e.max_budget > 0 ? (e.spend / e.max_budget) * 100 : 100;
-    out = quota(period, { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo) +
+    out = quota(period, { used_percentage: pct, resets_at: e.budget_reset_at }, stale, padTo, Boolean(why)) +
       SEP + `${C.dim}${usd(e.spend)}/${usd(e.max_budget)}${R}`;
   }
   const t = tier(e);
   if (t) out += SEP + t;
+  if (why) out += SEP + `${C.dim}${why}${e.at ? ` ${span(Math.max(0, Date.now() - e.at))}` : ""}${R}`;
   if (keyLeft < 7 * 86_400_000) {
     const days = Math.floor(keyLeft / 86_400_000);
     out += SEP + `${C.amber}key ${days >= 1 ? `${days}d` : countdown(e.expires)}${R}`;
@@ -489,14 +496,18 @@ async function probeCopilot(account) {
 }
 
 // The last tier seen outlives an error, so a change across one is still caught. The
-// first one ever seen is not news.
+// first one ever seen is not news. The last figures outlive it too, with `at` still the
+// time they were read; failed_at is what spaces out the retries.
 function saveBudget(account, result) {
   patchCache((cache) => {
     const was = cache[account.name] || {};
     const now = Date.now();
     const print = result.error ? was.tier : tierPrint(result);
     const changed = Boolean(was.tier) && print !== was.tier;
-    cache[account.name] = { ...result, at: now, tier: print, tier_changed: changed ? now : was.tier_changed };
+    const row = !result.error ? { ...result, at: now }
+      : was.spend == null ? { error: result.error, failed_at: now }
+      : { ...was, tried: undefined, error: result.error, failed_at: now };
+    cache[account.name] = { ...row, tier: print, tier_changed: changed ? now : was.tier_changed };
   });
 }
 
@@ -562,7 +573,7 @@ async function probe(name) {
 function probeIfStale(account, entry) {
   const now = Date.now();
   if (!account.credentials && !account.envFile && !account.litellm && !account.copilot) return;
-  if (now - Math.max(entry.at || 0, entry.tried || 0) < probeEvery(account)) return;
+  if (now - Math.max(entry.at || 0, entry.tried || 0, entry.failed_at || 0) < probeEvery(account)) return;
   patchCache((cache) => { cache[account.name] = { ...cache[account.name], tried: now }; });
   spawn(process.execPath, [__filename, "--probe", account.name], {
     detached: true,

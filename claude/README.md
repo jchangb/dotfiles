@@ -95,9 +95,11 @@ inditex  mo  80% ━━━━━━── 1d23h  │ $480/$600 │ developers �
 The figures come from the proxy's `GET /key/info`, which spends nothing, probed detached
 at most every five minutes and cached as `{ spend, max_budget, budget_reset_at, expires,
 team_id, models, tpm_limit, rpm_limit, max_parallel_requests, tier, tier_changed, at }`.
-The key and its `key_name` are never cached. When that fails the row reads `no key` (no
-`sk-` key in the file), `no url`, `offline`, or the HTTP status. `budget_duration` is
-ignored: some proxies report it wrong, and `budget_reset_at` is what counts.
+The key and its `key_name` are never cached. When that fails the row keeps its last
+figures, dimmed, and ends in why and how old they are (`offline 12m`); with none yet it
+reads just `no key` (no `sk-` key in the file), `no url`, `offline`, or the HTTP status.
+`budget_duration` is ignored: some proxies report it wrong, and `budget_reset_at` is what
+counts.
 
 #### The tier
 
